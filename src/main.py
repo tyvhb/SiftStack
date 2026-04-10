@@ -291,6 +291,16 @@ async def actor_main() -> None:
             Actor.log.info("Starting from page %d (skipping earlier pages)", start_page)
 
         try:
+            # ── Load last_run_date from Apify KVS (persists between runs) ──
+            if mode == "daily" and not since_date_override:
+                kvs = await Actor.open_key_value_store()
+                stored = await kvs.get_value("last_run_date")
+                if stored:
+                    since_date_override = stored
+                    Actor.log.info("Daily mode: using stored last_run_date = %s", stored)
+                else:
+                    Actor.log.info("Daily mode: no stored last_run_date, defaulting to 7 days")
+
             # ── Scrape ────────────────────────────────────────────────
             notices = await scrape_all(
                 mode=mode, searches=searches, proxy_url=proxy_url, on_batch=push_batch,
@@ -422,6 +432,12 @@ async def actor_main() -> None:
                     Actor.log.info("Slack notification sent")
                 except Exception as e:
                     Actor.log.warning("Slack notification failed: %s", e)
+
+            # ── Save last_run_date to Apify KVS for next run ─────
+            from datetime import datetime as _dt
+            kvs = await Actor.open_key_value_store()
+            await kvs.set_value("last_run_date", _dt.now().strftime("%Y-%m-%d"))
+            Actor.log.info("Saved last_run_date to KVS for next daily run")
 
             Actor.log.info("Done — %d notices exported (%.1f min)", total, elapsed_min)
 
