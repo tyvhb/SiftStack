@@ -104,8 +104,12 @@ async def _screenshot(page: Page, name: str) -> None:
         logger.debug("Screenshot failed (%s): %s", name, e)
 
 
-async def _click_next_step(page: Page, timeout: int = 10000) -> bool:
-    """Click the 'Next Step' button that appears in the upload wizard."""
+async def _click_next_step(page: Page, timeout: int = 20000) -> bool:
+    """Click the 'Next Step' button that appears in the upload wizard.
+
+    Default timeout is 20s to handle slow SPA rendering in headless/cloud
+    environments (Apify containers take longer than local desktop).
+    """
     try:
         btn = page.locator(
             'button:has-text("Next Step"), '
@@ -114,7 +118,7 @@ async def _click_next_step(page: Page, timeout: int = 10000) -> bool:
         )
         await btn.first.wait_for(state="visible", timeout=timeout)
         await btn.first.click()
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(2000)
         return True
     except PwTimeout:
         logger.warning("Next Step button not found within %dms", timeout)
@@ -168,8 +172,8 @@ async def upload_csv(
     # Navigate to records page (skip if already there from login)
     if "/records" not in page.url:
         await page.goto(DATASIFT_UPLOAD_URL, wait_until="domcontentloaded")
-    # Wait for SPA to fully render
-    await page.wait_for_timeout(5000)
+    # Wait for SPA to fully render (longer for headless/cloud environments)
+    await page.wait_for_timeout(8000)
 
     # Dismiss notifications popup if present
     try:
@@ -374,7 +378,7 @@ async def upload_csv(
     await _screenshot(page, "step1_form_filled")
 
     # Click "Next Step" to proceed to step 2
-    await _click_next_step(page, timeout=15000)
+    await _click_next_step(page, timeout=30000)
 
     # ── Wizard Step 2: Add tags ──
     logger.info("Wizard Step 2: Adding 'Courthouse Data' tag...")
@@ -448,13 +452,17 @@ async def upload_csv(
 
     # ── Wizard Step 3: Upload the file ──
     logger.info("Wizard Step 3: Uploading CSV file: %s", csv_path.name)
-    await page.wait_for_timeout(1500)
+    await page.wait_for_timeout(3000)
     await _screenshot(page, "step3_before_upload")
 
     try:
         file_input = page.locator('input[type="file"]')
-        if await file_input.count() == 0:
-            await page.wait_for_timeout(3000)
+        # Retry with increasing waits for slow SPA rendering
+        for wait in [3000, 5000, 8000]:
+            if await file_input.count() > 0:
+                break
+            logger.debug("File input not found, waiting %dms...", wait)
+            await page.wait_for_timeout(wait)
             file_input = page.locator('input[type="file"]')
 
         if await file_input.count() > 0:
