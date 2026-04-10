@@ -145,21 +145,29 @@ async def actor_main() -> None:
         pipeline_start = _time()
         actor_input = await Actor.get_input() or {}
 
-        # Override config credentials from Actor input
-        config.TNPN_EMAIL = actor_input.get("tn_username", "")
-        config.TNPN_PASSWORD = actor_input.get("tn_password", "")
-        config.CAPTCHA_API_KEY = actor_input.get("captcha_api_key", "")
-        config.ANTHROPIC_API_KEY = actor_input.get("anthropic_api_key", "")
-        config.SMARTY_AUTH_ID = actor_input.get("smarty_auth_id", "")
-        config.SMARTY_AUTH_TOKEN = actor_input.get("smarty_auth_token", "")
-        config.OPENWEBNINJA_API_KEY = actor_input.get("openwebninja_api_key", "")
-        config.SERPER_API_KEY = actor_input.get("serper_api_key", "")
-        config.FIRECRAWL_API_KEY = actor_input.get("firecrawl_api_key", "")
-        config.TRACERFY_API_KEY = actor_input.get("tracerfy_api_key", "")
-        config.DATASIFT_EMAIL = actor_input.get("datasift_email", "")
-        config.DATASIFT_PASSWORD = actor_input.get("datasift_password", "")
-        config.SLACK_WEBHOOK_URL = actor_input.get("slack_webhook_url", "")
-        config.TRESTLE_API_KEY = actor_input.get("trestle_api_key", "")
+        # Override config credentials from Actor input.
+        # Set both config.* AND os.environ so downstream modules that read
+        # from either source (e.g., datasift_uploader uses os.environ) pick them up.
+        _cred_map = {
+            "TNPN_EMAIL": actor_input.get("tn_username", ""),
+            "TNPN_PASSWORD": actor_input.get("tn_password", ""),
+            "CAPTCHA_API_KEY": actor_input.get("captcha_api_key", ""),
+            "ANTHROPIC_API_KEY": actor_input.get("anthropic_api_key", ""),
+            "SMARTY_AUTH_ID": actor_input.get("smarty_auth_id", ""),
+            "SMARTY_AUTH_TOKEN": actor_input.get("smarty_auth_token", ""),
+            "OPENWEBNINJA_API_KEY": actor_input.get("openwebninja_api_key", ""),
+            "SERPER_API_KEY": actor_input.get("serper_api_key", ""),
+            "FIRECRAWL_API_KEY": actor_input.get("firecrawl_api_key", ""),
+            "TRACERFY_API_KEY": actor_input.get("tracerfy_api_key", ""),
+            "DATASIFT_EMAIL": actor_input.get("datasift_email", ""),
+            "DATASIFT_PASSWORD": actor_input.get("datasift_password", ""),
+            "SLACK_WEBHOOK_URL": actor_input.get("slack_webhook_url", ""),
+            "TRESTLE_API_KEY": actor_input.get("trestle_api_key", ""),
+        }
+        for key, val in _cred_map.items():
+            setattr(config, key, val)
+            if val:
+                os.environ[key] = val
 
         mode = actor_input.get("mode", "daily")
         counties = actor_input.get("counties") or None
