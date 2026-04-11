@@ -15,93 +15,16 @@ from pathlib import Path
 import config
 from playwright.async_api import Page, TimeoutError as PwTimeout, async_playwright
 
+from datasift_core import (
+    save_cookies as _save_cookies,
+    login,
+    screenshot as _screenshot,
+    dismiss_popups as _dismiss_popups,
+)
+
 logger = logging.getLogger(__name__)
 
-DATASIFT_LOGIN_URL = "https://app.reisift.io/login"
 DATASIFT_UPLOAD_URL = "https://app.reisift.io/records/properties"
-DATASIFT_COOKIES_FILE = Path("datasift_cookies.json")
-
-
-async def _save_cookies(page: Page) -> None:
-    """Save browser cookies for session reuse."""
-    cookies = await page.context.cookies()
-    config.save_state(DATASIFT_COOKIES_FILE, cookies)
-    logger.debug("Saved %d DataSift cookies", len(cookies))
-
-
-async def _load_cookies(context) -> bool:
-    """Load saved cookies into browser context. Returns True if loaded."""
-    cookies = config.load_state(DATASIFT_COOKIES_FILE)
-    if not cookies:
-        return False
-    try:
-        await context.add_cookies(cookies)
-        logger.debug("Loaded %d DataSift cookies", len(cookies))
-        return True
-    except Exception as e:
-        logger.debug("Failed to load cookies: %s", e)
-        return False
-
-
-async def login(page: Page, email: str, password: str) -> bool:
-    """Log in to DataSift.ai (app.reisift.io). Returns True on success.
-
-    Tries saved cookies first, falls back to fresh login.
-    """
-    # Try cookies first
-    has_cookies = await _load_cookies(page.context)
-    if has_cookies:
-        await page.goto(DATASIFT_UPLOAD_URL, wait_until="domcontentloaded")
-        # Wait for SPA to settle — React app may redirect to login
-        await page.wait_for_timeout(5000)
-        # Check if we ended up on the login page or root (which also redirects to login)
-        current_url = page.url
-        if "/login" not in current_url and "/dashboard" in current_url or "/records" in current_url:
-            logger.info("DataSift session restored from cookies")
-            return True
-        logger.info("DataSift cookies expired (url=%s), doing fresh login", current_url)
-
-    # Fresh login
-    await page.goto(DATASIFT_LOGIN_URL, wait_until="domcontentloaded")
-
-    # Fill credentials
-    await page.get_by_role("textbox", name="Email").fill(email)
-    await page.get_by_role("textbox", name="Password").fill(password)
-
-    # Check "Remember me" and terms of use checkboxes
-    # These checkboxes use hidden inputs with styled labels — click the label instead
-    remember_label = page.locator('label:has-text("Remember me")')
-    if await remember_label.count() > 0:
-        await remember_label.first.click()
-
-    terms_label = page.locator('label:has-text("I\'ve read and agree")')
-    if await terms_label.count() > 0:
-        await terms_label.first.click()
-
-    # Click Sign In
-    await page.get_by_role("button", name="Sign In").click()
-
-    # Wait for navigation away from login page
-    try:
-        await page.wait_for_url("**/dashboard/general**", timeout=15000)
-    except PwTimeout:
-        # May redirect somewhere else — check we're not still on login
-        if "/login" in page.url:
-            logger.error("DataSift login failed — still on login page")
-            return False
-
-    await _save_cookies(page)
-    logger.info("DataSift login successful")
-    return True
-
-
-async def _screenshot(page: Page, name: str) -> None:
-    """Take a debug screenshot (saved to project root)."""
-    try:
-        await page.screenshot(path=f"datasift_{name}.png")
-        logger.debug("Screenshot: datasift_%s.png", name)
-    except Exception as e:
-        logger.debug("Screenshot failed (%s): %s", name, e)
 
 
 async def _click_next_step(page: Page, timeout: int = 20000) -> bool:
@@ -592,54 +515,6 @@ async def upload_csv(
 
 
 DATASIFT_RECORDS_URL = "https://app.reisift.io/records/properties"
-
-
-async def _dismiss_popups(page: Page) -> None:
-    """Dismiss notification popups that may overlay buttons."""
-    try:
-        # "NO, THANKS" is NOT a <button> — it's a text/link element in the notification popup.
-        # Try clicking ANY element with dismiss-like text (not just buttons).
-        for text in ["NO, THANKS", "No, thanks", "No Thanks", "NO THANKS", "Not Now", "Dismiss"]:
-            el = page.get_by_text(text, exact=True)
-            if await el.count() > 0:
-                await el.first.click(force=True)
-                await page.wait_for_timeout(1000)
-                logger.debug("Dismissed popup via '%s'", text)
-                return
-
-        # JavaScript fallback: remove the popup from the DOM entirely
-        removed = await page.evaluate("""() => {
-            let removed = 0;
-            // Remove Beamer NPS survey iframe (blocks pointer events globally)
-            const nps = document.getElementById('npsIframeContainer');
-            if (nps) { nps.remove(); removed++; }
-            // Also remove by class
-            document.querySelectorAll('[class*="nps-iframe"], [class*="beamer"]').forEach(
-                el => { el.remove(); removed++; }
-            );
-            // Look for the notification popup overlay
-            const els = document.querySelectorAll('[class*="notification"], [class*="Notification"], [class*="popup"], [class*="Popup"]');
-            for (const el of els) {
-                if (el.textContent && el.textContent.includes('notifications')) {
-                    el.remove();
-                    removed++;
-                }
-            }
-            // Also try removing any fixed/absolute overlays at the top
-            const overlays = document.querySelectorAll('[style*="position: fixed"], [style*="position:fixed"]');
-            for (const o of overlays) {
-                if (o.textContent && o.textContent.includes('notifications')) {
-                    o.remove();
-                    removed++;
-                }
-            }
-            return removed;
-        }""")
-        if removed:
-            logger.debug("Removed %d popup elements via JS", removed)
-            await page.wait_for_timeout(500)
-    except Exception as e:
-        logger.debug("Popup JS removal failed: %s", e)
 
 
 async def _navigate_to_records(page: Page) -> None:
