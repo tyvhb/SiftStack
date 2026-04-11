@@ -112,9 +112,14 @@ async def _dismiss_all_popups(page) -> None:
         const nps = document.getElementById('npsIframeContainer');
         if (nps) nps.remove();
 
-        // Remove all Beamer elements
+        // Remove Beamer push modal (also blocks ALL pointer events)
+        const pushModal = document.getElementById('beamerPushModal');
+        if (pushModal) pushModal.remove();
+
+        // Remove ALL Beamer elements
         document.querySelectorAll(
-            '[id*="beamer"], [class*="beamer"], [id*="nps"], [class*="nps"]'
+            '[id*="beamer"], [class*="beamer"], [id*="nps"], [class*="nps"], '
+            + '[id*="Beamer"], [class*="Beamer"], [class*="pushModal"]'
         ).forEach(el => el.remove());
 
         // Remove any blocking iframes
@@ -441,119 +446,143 @@ async def _select_county(page, county: str) -> bool:
 # ── Data Extraction ───────────────────────────────────────────────────
 
 async def _extract_all_table_rows(page) -> list[list[str]]:
-    """Extract ALL rows from the visible data table via infinite scroll.
+    """Extract ALL rows from the Market Finder data table across all pages.
 
-    CRITICAL: Scrolls until no new rows appear to ensure EVERY ZIP/neighborhood
-    is captured. Never stops at a partial result.
+    CRITICAL: The Market Finder uses PAGINATION (not infinite scroll).
+    The table shows 20 rows per page with "Page X of Y" controls.
+    This function extracts every page to get EVERY ZIP/neighborhood.
 
-    The Market Finder table has 7 columns:
-    NAME | TOTAL INV. TRANS. FOR 6 MO. | HOMES ON MARKET | HOMES SOLD LAST MONTH |
-    MEDIAN DAYS ON MARKET | MEDIAN HOME VALUE | MEDIAN SALE PRICE
+    The table is div-based (Tablestyles__TableContainer with TableRow/TableCell
+    styled-components), NOT an HTML <table>.
     """
     all_rows = []
     seen_keys = set()
-    prev_count = 0
-    stale_rounds = 0
 
-    for attempt in range(100):  # Up to 100 scroll attempts for large counties
-        # Extract visible rows via JS — use <td> elements only to avoid
-        # double-counting from sub-elements (spans/divs inside cells)
-        data = await page.evaluate("""() => {
-            const rows = [];
+    # JS to extract current page's rows from the styled-components table
+    EXTRACT_PAGE_JS = """() => {
+        const rows = [];
 
-            // Find the main data table in the content area (x > 200)
-            const tables = document.querySelectorAll('table');
-            for (const table of tables) {
-                const rect = table.getBoundingClientRect();
-                if (rect.x < 150 || rect.width < 300) continue;
-
-                const trs = table.querySelectorAll('tbody tr, tr');
-                for (const tr of trs) {
-                    // Use ONLY direct <td> children — prevents double-counting
-                    // from nested elements within cells
-                    const cells = tr.querySelectorAll('td');
-                    if (cells.length >= 7) {
-                        // Extract only the direct text content of each <td>
-                        const row = Array.from(cells).map(c => c.innerText.trim());
-                        rows.push(row);
-                    }
-                }
-                if (rows.length > 0) return rows;
-            }
-
-            // Fallback: div-based table (styled-components)
-            const containers = document.querySelectorAll(
-                '[class*="Table"], [class*="DataTable"], [role="table"], [class*="Grid"]'
-            );
-            for (const container of containers) {
-                const rect = container.getBoundingClientRect();
-                if (rect.x < 150 || rect.width < 300) continue;
-
-                const divRows = container.querySelectorAll(
-                    '[class*="Row"]:not([class*="Header"]):not([class*="header"]), '
-                    + '[role="row"]:not([role="columnheader"])'
-                );
-                for (const dr of divRows) {
-                    // For div tables, use only direct child cells (not nested)
-                    const cells = dr.querySelectorAll(':scope > [class*="Cell"], :scope > [role="cell"], :scope > td');
-                    if (cells.length >= 7) {
-                        const row = Array.from(cells).map(c => c.innerText.trim());
-                        if (row.some(v => v.length > 0)) rows.push(row);
-                    }
+        // Strategy 1: Styled-components TableContainer (Market Finder's actual structure)
+        const container = document.querySelector('[class*="Tablestyles__TableContainer"]') ||
+                          document.querySelector('[class*="TableContainer"]');
+        if (container) {
+            const rowEls = container.querySelectorAll('[class*="TableRow"], [class*="Row"]');
+            for (const rowEl of rowEls) {
+                const cells = rowEl.querySelectorAll('[class*="TableCell"], [class*="Cell"]');
+                if (cells.length >= 7) {
+                    const row = Array.from(cells).map(c => c.innerText.trim());
+                    if (row.some(v => v.length > 0)) rows.push(row);
                 }
             }
-            return rows;
-        }""")
+            if (rows.length > 0) return rows;
+        }
 
+        // Strategy 2: Standard HTML <table> (fallback)
+        const tables = document.querySelectorAll('table');
+        for (const table of tables) {
+            const rect = table.getBoundingClientRect();
+            if (rect.x < 150 || rect.width < 300) continue;
+            const trs = table.querySelectorAll('tbody tr, tr');
+            for (const tr of trs) {
+                const cells = tr.querySelectorAll('td');
+                if (cells.length >= 7) {
+                    rows.push(Array.from(cells).map(c => c.innerText.trim()));
+                }
+            }
+        }
+        return rows;
+    }"""
+
+    # JS to get pagination info: {from, to, total, currentPage, totalPages}
+    PAGINATION_JS = """() => {
+        const text = document.body.innerText;
+        const rangeMatch = text.match(/(\\d+)-(\\d+) of (\\d+)/);
+        const pageMatch = text.match(/of (\\d+)/);
+
+        // Find current page input value
+        const pageInput = document.querySelector(
+            '[class*="Pagination"] input'
+        );
+        const currentPage = pageInput ? parseInt(pageInput.value) || 1 : 1;
+
+        return {
+            from: rangeMatch ? parseInt(rangeMatch[1]) : 0,
+            to: rangeMatch ? parseInt(rangeMatch[2]) : 0,
+            total: rangeMatch ? parseInt(rangeMatch[3]) : 0,
+            currentPage,
+            totalPages: pageMatch ? parseInt(pageMatch[1]) : 1,
+        };
+    }"""
+
+    # JS to click the "next page" button (right-most button in pagination)
+    NEXT_PAGE_JS = """() => {
+        const pagContainer = document.querySelector(
+            '[class*="PaginationInnerContainer"]'
+        );
+        if (!pagContainer) return false;
+
+        // The pagination has: [prev_btn] [page_input] [of N] [next_btn]
+        // Next button is the LAST <button> in the container
+        const buttons = pagContainer.querySelectorAll('button');
+        if (buttons.length >= 2) {
+            const nextBtn = buttons[buttons.length - 1];
+            nextBtn.click();
+            return true;
+        }
+        return false;
+    }"""
+
+    # First, scroll the main page body down so pagination controls are in view
+    await page.evaluate("""() => {
+        const body = document.querySelector('[class*="AdminPage__AdminPageBody"]');
+        if (body) body.scrollTop = body.scrollHeight;
+    }""")
+    await page.wait_for_timeout(1000)
+
+    # Extract page by page
+    max_pages = 50  # Safety limit
+    for page_num in range(max_pages):
+        # Get pagination info
+        pag = await page.evaluate(PAGINATION_JS)
+        logger.info("Page %d: showing %d-%d of %d (page %d of %d)",
+                     page_num + 1, pag["from"], pag["to"], pag["total"],
+                     pag["currentPage"], pag["totalPages"])
+
+        # Extract current page rows
+        data = await page.evaluate(EXTRACT_PAGE_JS)
+        new_rows = 0
         for row in data:
-            # Use first cell as dedup key (ZIP code or neighborhood name)
             key = row[0] if row else ""
-            if key and key not in seen_keys and key.upper() not in ("ZIP CODE", "ZIP", "NEIGHBORHOOD", ""):
+            if key and key not in seen_keys and key.upper() not in (
+                "ZIP CODE", "ZIP", "NEIGHBORHOOD", ""
+            ):
                 seen_keys.add(key)
                 all_rows.append(row)
+                new_rows += 1
 
-        if len(all_rows) == prev_count:
-            stale_rounds += 1
-            if stale_rounds >= 3:  # No new data after 3 consecutive scrolls
-                logger.debug("No new rows after %d scrolls (total: %d)", attempt, len(all_rows))
-                break
-        else:
-            stale_rounds = 0
+        logger.debug("  Extracted %d new rows from page %d", new_rows, page_num + 1)
 
-        prev_count = len(all_rows)
+        # Check if we've got all rows
+        if pag["total"] > 0 and len(all_rows) >= pag["total"]:
+            logger.info("Got all %d rows", len(all_rows))
+            break
 
-        # Scroll the table container down to trigger lazy loading
-        await page.evaluate("""() => {
-            const candidates = [
-                document.querySelector('[class*="TableBody"]'),
-                document.querySelector('[class*="table-body"]'),
-                document.querySelector('[class*="Table"]'),
-                document.querySelector('[class*="DataTable"]'),
-                document.querySelector('[class*="Grid"]'),
-                document.querySelector('[role="table"]'),
-                document.querySelector('table'),
-            ].filter(Boolean);
+        # Check if this is the last page
+        if pag["to"] >= pag["total"] or pag["currentPage"] >= pag["totalPages"]:
+            logger.info("Reached last page (%d of %d)", pag["currentPage"], pag["totalPages"])
+            break
 
-            // Find a scrollable container
-            for (const el of candidates) {
-                if (el.scrollHeight > el.clientHeight + 10) {
-                    el.scrollTop = el.scrollHeight;
-                    return 'scrolled_container';
-                }
-                // Try parent
-                if (el.parentElement && el.parentElement.scrollHeight > el.parentElement.clientHeight + 10) {
-                    el.parentElement.scrollTop = el.parentElement.scrollHeight;
-                    return 'scrolled_parent';
-                }
-            }
-            // Fallback: scroll the window
-            window.scrollTo(0, document.body.scrollHeight);
-            return 'scrolled_window';
-        }""")
-        await page.wait_for_timeout(1500)
+        # Click next page
+        clicked = await page.evaluate(NEXT_PAGE_JS)
+        if not clicked:
+            logger.warning("Could not click next page button")
+            break
 
-    logger.info("Extracted %d data rows from table (after %d scroll attempts)",
-                len(all_rows), min(attempt + 1, 100))
+        # Wait for new data to load
+        await page.wait_for_timeout(2000)
+
+    logger.info("Extracted %d total rows across %d pages (expected %d)",
+                len(all_rows), page_num + 1, pag.get("total", "?"))
     return all_rows
 
 
