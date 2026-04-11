@@ -362,24 +362,35 @@ async def actor_main() -> None:
                 Actor.log.info("Tracerfy skipped — no API key configured")
 
             # ── Generate Deep Prospecting PDFs ────────────────────────
+            # Only generate PDFs for records that have deep prospecting data:
+            # deceased owners with heir/DM info, or records with signing chains.
+            # Basic records (just address + owner) don't need a PDF.
             pdf_urls = []
-            try:
-                from report_generator import generate_record_pdf
-                kvs = await Actor.open_key_value_store()
-                kvs_id = kvs._id if hasattr(kvs, '_id') else ''
-                report_dir = Path("output/reports")
+            dp_candidates = [
+                n for n in notices
+                if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
+            ]
+            if dp_candidates:
+                try:
+                    from report_generator import generate_record_pdf
+                    kvs = await Actor.open_key_value_store()
+                    kvs_id = kvs._id if hasattr(kvs, '_id') else ''
+                    report_dir = Path("output/reports")
 
-                for n in notices:
-                    pdf_path = generate_record_pdf(n, output_dir=report_dir)
-                    key = pdf_path.name
-                    with open(pdf_path, "rb") as f:
-                        await kvs.set_value(key, f.read(), content_type="application/pdf")
-                    url = f"https://api.apify.com/v2/key-value-stores/{kvs_id}/records/{key}"
-                    pdf_urls.append({"address": n.address, "url": url})
+                    for n in dp_candidates:
+                        pdf_path = generate_record_pdf(n, output_dir=report_dir)
+                        key = pdf_path.name
+                        with open(pdf_path, "rb") as f:
+                            await kvs.set_value(key, f.read(), content_type="application/pdf")
+                        url = f"https://api.apify.com/v2/key-value-stores/{kvs_id}/records/{key}"
+                        pdf_urls.append({"address": n.address, "url": url})
 
-                Actor.log.info("Generated %d deep prospecting PDFs", len(pdf_urls))
-            except Exception as e:
-                Actor.log.warning("PDF generation failed: %s — continuing", e)
+                    Actor.log.info("Generated %d deep prospecting PDFs (%d records skipped — no DP data)",
+                                   len(pdf_urls), total - len(dp_candidates))
+                except Exception as e:
+                    Actor.log.warning("PDF generation failed: %s — continuing", e)
+            else:
+                Actor.log.info("No records need deep prospecting PDFs")
 
             # ── Write CSV ─────────────────────────────────────────────
             csv_path = write_csv(notices)
