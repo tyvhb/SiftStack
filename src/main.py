@@ -343,21 +343,32 @@ async def actor_main() -> None:
 
             total = len(notices)
 
-            # ── Tracerfy Skip Trace ───────────────────────────────────
+            # ── Tracerfy Skip Trace (DP candidates only) ────────────
+            # Only run Tracerfy on records that need deep prospecting
+            # (deceased owners, heir maps, decision makers). Basic records
+            # get skip traced for free inside DataSift's unlimited plan.
             tracerfy_stats = None
             if do_tracerfy and config.TRACERFY_API_KEY:
-                Actor.log.info("Running Tracerfy batch skip trace...")
-                try:
-                    from tracerfy_skip_tracer import batch_skip_trace
-                    tracerfy_stats = batch_skip_trace(notices)
-                    Actor.log.info(
-                        "Tracerfy: %d/%d matched, %d phones, %d emails, $%.2f",
-                        tracerfy_stats["matched"], tracerfy_stats["submitted"],
-                        tracerfy_stats["phones_found"], tracerfy_stats["emails_found"],
-                        tracerfy_stats["cost"],
-                    )
-                except Exception as e:
-                    Actor.log.warning("Tracerfy skip trace failed: %s — continuing", e)
+                dp_for_tracerfy = [
+                    n for n in notices
+                    if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
+                ]
+                if dp_for_tracerfy:
+                    Actor.log.info("Running Tracerfy on %d DP candidates (%d basic records skipped)...",
+                                   len(dp_for_tracerfy), total - len(dp_for_tracerfy))
+                    try:
+                        from tracerfy_skip_tracer import batch_skip_trace
+                        tracerfy_stats = batch_skip_trace(dp_for_tracerfy)
+                        Actor.log.info(
+                            "Tracerfy: %d/%d matched, %d phones, %d emails, $%.2f",
+                            tracerfy_stats["matched"], tracerfy_stats["submitted"],
+                            tracerfy_stats["phones_found"], tracerfy_stats["emails_found"],
+                            tracerfy_stats["cost"],
+                        )
+                    except Exception as e:
+                        Actor.log.warning("Tracerfy skip trace failed: %s — continuing", e)
+                else:
+                    Actor.log.info("No DP candidates — Tracerfy skipped (0 deceased/DM records)")
             elif do_tracerfy:
                 Actor.log.info("Tracerfy skipped — no API key configured")
 
