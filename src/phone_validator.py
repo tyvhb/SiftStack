@@ -346,6 +346,138 @@ def process_phones(
     return results, errors
 
 
+# ── Per-Notice Phone Scoring (DM + heirs) ────────────────────────────────
+
+
+DM_PHONE_FIELDS = [
+    "primary_phone", "mobile_1", "mobile_2", "mobile_3", "mobile_4",
+    "mobile_5", "landline_1", "landline_2", "landline_3",
+]
+
+
+def _collect_phones_from_notice(notice) -> list[str]:
+    """Return all cleaned phones on a notice — DM #1 flat fields + heir_map_json."""
+    out: list[str] = []
+    for field in DM_PHONE_FIELDS:
+        val = getattr(notice, field, "") or ""
+        cleaned = clean_phone(val)
+        if cleaned:
+            out.append(cleaned)
+
+    heir_json = getattr(notice, "heir_map_json", "") or ""
+    if heir_json:
+        try:
+            heirs = json.loads(heir_json)
+        except (ValueError, TypeError):
+            heirs = []
+        if isinstance(heirs, list):
+            for h in heirs:
+                if not isinstance(h, dict):
+                    continue
+                for ph in h.get("phones", []) or []:
+                    cleaned = clean_phone(ph)
+                    if cleaned:
+                        out.append(cleaned)
+    return out
+
+
+def score_record_phones(
+    notices: list,
+    api_key: str | None = None,
+    tiers: dict | None = None,
+    add_litigator: bool = False,
+    batch_size: int = 10,
+    delay: float = 0.1,
+) -> dict[str, dict]:
+    """Trestle-score every phone attached to these notices (DM #1 + all heirs).
+
+    Closes the coverage gap where only DM #1 phones got scored via the CSV-export
+    workflow. Writes a `phone_scores` dict onto each heir in heir_map_json so
+    downstream consumers (PDF, DataSift export) can surface tier badges.
+
+    Returns a flat `{cleaned_phone: {"score": int, "tier": str, "line_type": str}}`
+    dict, directly usable as the `phone_tiers` parameter of
+    `report_generator.generate_record_pdf`.
+    """
+    key = api_key or getattr(config, "TRESTLE_API_KEY", "")
+    if not key:
+        logger.info("Trestle API key not set — skipping per-record phone scoring")
+        return {}
+    if tiers is None:
+        tiers = DEFAULT_TIERS
+
+    # Collect unique cleaned phones across all notices
+    unique: dict[str, None] = {}
+    for n in notices:
+        for p in _collect_phones_from_notice(n):
+            unique.setdefault(p, None)
+    phones = list(unique.keys())
+    if not phones:
+        return {}
+
+    logger.info("Trestle scoring %d unique phones across %d records (~$%.2f)",
+                len(phones), len(notices), len(phones) * COST_PER_PHONE)
+
+    results: dict[str, dict] = {}
+    for batch_start in range(0, len(phones), batch_size):
+        batch = phones[batch_start : batch_start + batch_size]
+        with ThreadPoolExecutor(max_workers=min(batch_size, len(batch))) as executor:
+            futures = {
+                executor.submit(call_trestle, ph, key, add_litigator): ph
+                for ph in batch
+            }
+            for future in as_completed(futures):
+                ph = futures[future]
+                try:
+                    data = future.result()
+                except Exception as e:
+                    logger.debug("Trestle exception on %s: %s", ph, e)
+                    continue
+                if "error" in data and not data.get("is_valid"):
+                    if data.get("error") == "Invalid API key":
+                        logger.error("Invalid Trestle API key — aborting heir scoring")
+                        return results
+                    continue
+                score = data.get("activity_score")
+                line_type = data.get("line_type")
+                results[ph] = {
+                    "score": score,
+                    "tier": assign_tier(score, tiers),
+                    "line_type": line_type,
+                }
+        if batch_start + batch_size < len(phones) and delay > 0:
+            time.sleep(delay)
+
+    # Persist per-heir scores back into heir_map_json so downstream consumers
+    # don't need the global dict to surface tier info.
+    for n in notices:
+        heir_json = getattr(n, "heir_map_json", "") or ""
+        if not heir_json:
+            continue
+        try:
+            heirs = json.loads(heir_json)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(heirs, list):
+            continue
+        mutated = False
+        for h in heirs:
+            if not isinstance(h, dict):
+                continue
+            scores: dict[str, dict] = {}
+            for ph in h.get("phones", []) or []:
+                cleaned = clean_phone(ph)
+                if cleaned and cleaned in results:
+                    scores[ph] = results[cleaned]
+            if scores:
+                h["phone_scores"] = scores
+                mutated = True
+        if mutated:
+            n.heir_map_json = json.dumps(heirs, ensure_ascii=False)
+
+    return results
+
+
 # ── Output Writers ────────────────────────────────────────────────────────
 
 

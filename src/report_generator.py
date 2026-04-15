@@ -24,6 +24,8 @@ from reportlab.platypus import (
     HRFlowable,
 )
 
+import case_summary
+import config
 from notice_parser import NoticeData
 
 logger = logging.getLogger(__name__)
@@ -226,6 +228,87 @@ def _address_slug(notice: NoticeData) -> str:
     return slug[:50]
 
 
+# ── Case Summary helpers (deceased-owner streamline section) ─────────
+
+def _bullet_list(items: list[str]) -> list:
+    """Return a list of Paragraph flowables rendering plain strings as bullets."""
+    return [Paragraph(f"&#8226;&nbsp; {item}", BODY_STYLE) for item in items if item]
+
+
+def _family_tree_table(grouped: dict[str, list[dict]]) -> Table | None:
+    """Render grouped heirs as a two-column relationship → names table."""
+    if not grouped:
+        return None
+
+    rows = []
+    for group_label, heirs in grouped.items():
+        lines = []
+        for heir in heirs:
+            name = (heir.get("name") or "").strip() or "—"
+            status = (heir.get("status") or "").lower()
+            if "deceased" in status:
+                name_html = f'<font color="#e94560">{name}</font>'
+            elif "living" in status:
+                name_html = f'<font color="#2ecc71">{name}</font>'
+            else:
+                name_html = f'<font color="#f39c12">{name}</font>'
+            badges = []
+            phones = heir.get("phones") or []
+            emails = heir.get("emails") or []
+            if phones:
+                badges.append(f"{len(phones)}ph")
+            if emails:
+                badges.append(f"{len(emails)}em")
+            if heir.get("signing_authority"):
+                badges.append("signer")
+            badge_str = f' <font color="#7f8c8d">[{", ".join(badges)}]</font>' if badges else ""
+            rel = (heir.get("relationship") or "").strip()
+            rel_str = f' <font color="#7f8c8d">— {rel}</font>' if rel else ""
+            lines.append(f"{name_html}{rel_str}{badge_str}")
+        rows.append((group_label, "<br/>".join(lines) or "—"))
+    return _data_table(rows, col_widths=[1.8 * inch, 4.7 * inch])
+
+
+def _add_case_summary(story: list, notice: NoticeData) -> None:
+    """Render the Case Summary block (deceased-owner records only)."""
+    story.append(_section_header("Case Summary"))
+
+    # Situation prose
+    prose = case_summary.build_situation_prose(
+        notice, api_key=getattr(config, "ANTHROPIC_API_KEY", "") or None,
+    )
+    if prose:
+        story.append(Spacer(1, 4))
+        story.append(Paragraph(f"<b>Situation:</b> {prose}", BODY_STYLE))
+        story.append(Spacer(1, 6))
+
+    # Key findings
+    findings = case_summary.build_key_findings(notice)
+    if findings:
+        story.append(Paragraph("<b>Key Findings</b>", BODY_BOLD))
+        for flow in _bullet_list(findings):
+            story.append(flow)
+        story.append(Spacer(1, 6))
+
+    # Family tree (grouped heirs)
+    grouped = case_summary.group_heirs(notice.heir_map_json)
+    if grouped:
+        story.append(Paragraph("<b>Family Tree</b>", BODY_BOLD))
+        story.append(Spacer(1, 2))
+        tree = _family_tree_table(grouped)
+        if tree is not None:
+            story.append(tree)
+        story.append(Spacer(1, 6))
+
+    # Recommended next steps
+    steps = case_summary.build_next_steps(notice)
+    if steps:
+        story.append(Paragraph("<b>Recommended Next Steps</b>", BODY_BOLD))
+        for flow in _bullet_list(steps):
+            story.append(flow)
+        story.append(Spacer(1, 6))
+
+
 # ── Main Generator ───────────────────────────────────────────────────
 
 def generate_record_pdf(
@@ -274,6 +357,12 @@ def generate_record_pdf(
         width="100%", thickness=2, color=BRAND_HIGHLIGHT,
         spaceAfter=10, spaceBefore=0,
     ))
+
+    # ── Case Summary (deceased-owner records only) ──────────────
+    # Rendered first so an acquisitions manager can read the situation,
+    # findings, family tree, and next steps before scrolling into detail tables.
+    if notice.owner_deceased == "yes":
+        _add_case_summary(story, notice)
 
     # ── Property Details ────────────────────────────────────────
     story.append(_section_header("Property Details"))

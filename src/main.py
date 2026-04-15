@@ -296,9 +296,10 @@ async def actor_main() -> None:
             Actor.log.info("Starting from page %d (skipping earlier pages)", start_page)
 
         try:
+            kvs = await Actor.open_key_value_store()
+
             # ── Load last_run_date from Apify KVS (persists between runs) ──
             if mode == "daily" and not since_date_override:
-                kvs = await Actor.open_key_value_store()
                 stored = await kvs.get_value("last_run_date")
                 if stored:
                     since_date_override = stored
@@ -306,12 +307,29 @@ async def actor_main() -> None:
                 else:
                     Actor.log.info("Daily mode: no stored last_run_date, defaulting to 7 days")
 
+            # ── Load cross-run seen-ID cache from KVS (makes daily re-runs idempotent) ──
+            seen_ids = await kvs.get_value("seen_notice_ids") or {}
+            Actor.log.info("Loaded %d previously-seen notice IDs from KVS", len(seen_ids))
+
+            async def persist_seen_ids(ids: dict) -> None:
+                """Mid-run persistence — if a later search crashes, progress is kept."""
+                try:
+                    await kvs.set_value("seen_notice_ids", ids)
+                    await kvs.set_value(
+                        "last_run_date",
+                        datetime.now().strftime("%Y-%m-%d"),
+                    )
+                except Exception as e:
+                    Actor.log.warning("Failed to persist seen_notice_ids to KVS: %s", e)
+
             # ── Scrape ────────────────────────────────────────────────
             notices = await scrape_all(
                 mode=mode, searches=searches, proxy_url=proxy_url, on_batch=push_batch,
                 since_date_override=since_date_override or None,
                 llm_api_key=config.ANTHROPIC_API_KEY or None,
                 start_page=start_page,
+                seen_ids=seen_ids,
+                on_search_complete=persist_seen_ids,
             )
             # Handle async probate lookup before pipeline (requires await)
             probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]
@@ -381,6 +399,19 @@ async def actor_main() -> None:
                 n for n in notices
                 if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
             ]
+
+            # Score every phone (DM #1 + all heirs) with Trestle before rendering,
+            # so signing-chain phones get tier badges — not just DM #1's.
+            phone_tiers: dict = {}
+            if dp_candidates and config.TRESTLE_API_KEY:
+                try:
+                    from phone_validator import score_record_phones
+                    phone_tiers = score_record_phones(dp_candidates, config.TRESTLE_API_KEY)
+                    Actor.log.info("Trestle scored %d unique phones across DP candidates",
+                                   len(phone_tiers))
+                except Exception as e:
+                    Actor.log.warning("Per-record Trestle scoring failed: %s — continuing", e)
+
             if dp_candidates:
                 try:
                     from report_generator import generate_record_pdf
@@ -389,7 +420,9 @@ async def actor_main() -> None:
                     report_dir = Path("output/reports")
 
                     for n in dp_candidates:
-                        pdf_path = generate_record_pdf(n, output_dir=report_dir)
+                        pdf_path = generate_record_pdf(
+                            n, output_dir=report_dir, phone_tiers=phone_tiers,
+                        )
                         key = pdf_path.name
                         with open(pdf_path, "rb") as f:
                             await kvs.set_value(key, f.read(), content_type="application/pdf")
@@ -514,11 +547,13 @@ async def actor_main() -> None:
                 except Exception as e:
                     Actor.log.warning("Slack notification failed: %s", e)
 
-            # ── Save last_run_date to Apify KVS for next run ─────
-            from datetime import datetime as _dt
-            kvs = await Actor.open_key_value_store()
-            await kvs.set_value("last_run_date", _dt.now().strftime("%Y-%m-%d"))
-            Actor.log.info("Saved last_run_date to KVS for next daily run")
+            # ── Save last_run_date + seen_notice_ids to Apify KVS for next run ─────
+            await kvs.set_value("last_run_date", datetime.now().strftime("%Y-%m-%d"))
+            await kvs.set_value("seen_notice_ids", seen_ids)
+            Actor.log.info(
+                "Saved last_run_date + %d seen_notice_ids to KVS for next daily run",
+                len(seen_ids),
+            )
 
             Actor.log.info("Done — %d notices exported (%.1f min)", total, elapsed_min)
 
@@ -1740,6 +1775,21 @@ def _run_scrape_pipeline(args, searches) -> None:
                 tracerfy_stats["phones_found"], tracerfy_stats["emails_found"],
                 tracerfy_stats["cost"],
             )
+            # Score every phone (DM #1 + all heirs) — writes per-heir phone_scores
+            # into heir_map_json so DataSift Notes and PDFs can surface tier badges.
+            if cfg.TRESTLE_API_KEY:
+                from phone_validator import score_record_phones
+                dp_cands = [
+                    n for n in notices
+                    if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
+                ]
+                if dp_cands:
+                    try:
+                        tiers_map = score_record_phones(dp_cands, cfg.TRESTLE_API_KEY)
+                        logging.info("Trestle scored %d unique phones across %d DP records",
+                                     len(tiers_map), len(dp_cands))
+                    except Exception as e:
+                        logging.warning("Per-record Trestle scoring failed: %s", e)
 
     # Write output
     if args.split:

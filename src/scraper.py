@@ -20,6 +20,8 @@ from config import (
     REQUEST_DELAY_MIN,
     RESULTS_PER_PAGE,
     SAVED_SEARCHES,
+    SEEN_IDS_FILE,
+    SEEN_IDS_PRUNE_DAYS,
     SMART_SEARCH_URL,
     STATE_FILE,
     SavedSearch,
@@ -32,6 +34,7 @@ from config import (
     SEL_SAVED_SEARCHES_DROPDOWN,
     SEL_VIEW_BUTTON_PATTERN,
 )
+from data_formatter import _notice_id_from_url
 from foreclosure_filter import is_valid_foreclosure
 from notice_parser import NoticeData, is_target_county, parse_notice_page
 
@@ -185,6 +188,7 @@ async def run_saved_search(
     on_page_batch=None,
     start_page: int = 1,
     max_notices: int = 0,
+    seen_ids: dict[str, str] | None = None,
 ) -> list[NoticeData]:
     """Select a saved search from the dropdown, paginate, and scrape each notice.
 
@@ -249,7 +253,7 @@ async def run_saved_search(
 
     while True:
         logger.info("  Scraping page %d/%d", current_page, total_pages)
-        page_notices = await _scrape_results_page(page, search, since_date, llm_api_key)
+        page_notices = await _scrape_results_page(page, search, since_date, llm_api_key, seen_ids)
         notices.extend(page_notices)
 
         # Push this page's results immediately so they survive timeouts
@@ -303,6 +307,7 @@ async def _scrape_results_page(
     search: SavedSearch,
     since_date: str | None,
     llm_api_key: str | None = None,
+    seen_ids: dict[str, str] | None = None,
 ) -> list[NoticeData]:
     """Click each View button on a results page, solve CAPTCHA, parse notice."""
     notices: list[NoticeData] = []
@@ -359,6 +364,15 @@ async def _scrape_results_page(
                 await page.wait_for_load_state("networkidle")
                 await delay()
 
+                # Cross-run dedup: if we've seen this notice ID before, skip CAPTCHA entirely
+                notice_id = _notice_id_from_url(page.url)
+                if seen_ids is not None and notice_id and notice_id in seen_ids:
+                    logger.info("  Skipping already-processed notice ID=%s", notice_id)
+                    await page.go_back()
+                    await page.wait_for_load_state("networkidle")
+                    await delay()
+                    break  # next result
+
                 # Check if notice content is already visible (CAPTCHA previously solved in session)
                 content_visible = await page.query_selector("text='Notice Content'")
                 if not content_visible:
@@ -375,6 +389,10 @@ async def _scrape_results_page(
                 notice = await parse_notice_page(page, search.county, search.notice_type, llm_api_key)
                 if pub_date:
                     notice.date_added = pub_date
+
+                # Record this notice ID so future runs don't re-process it
+                if seen_ids is not None and notice_id:
+                    seen_ids[notice_id] = notice.date_added or datetime.now().strftime("%Y-%m-%d")
 
                 # Apply foreclosure filter
                 if not is_valid_foreclosure(notice):
@@ -557,6 +575,27 @@ def save_last_run_date() -> None:
     config.save_state(STATE_FILE, {"last_run_date": datetime.now().strftime("%Y-%m-%d")})
 
 
+def load_seen_ids() -> dict[str, str]:
+    """Load notice IDs already processed in prior runs, pruning entries older than SEEN_IDS_PRUNE_DAYS.
+
+    Returns a dict of {notice_id: "YYYY-MM-DD"}. The date is when we first saw the
+    notice, used only for pruning to bound file size.
+    """
+    data = config.load_state(SEEN_IDS_FILE)
+    if not data:
+        return {}
+    cutoff = (datetime.now() - timedelta(days=SEEN_IDS_PRUNE_DAYS)).strftime("%Y-%m-%d")
+    pruned = {nid: d for nid, d in data.items() if d >= cutoff}
+    if len(pruned) < len(data):
+        logger.info("Pruned %d seen IDs older than %d days", len(data) - len(pruned), SEEN_IDS_PRUNE_DAYS)
+    return pruned
+
+
+def save_seen_ids(seen: dict[str, str]) -> None:
+    """Persist the seen-notice-ID cache to disk."""
+    config.save_state(SEEN_IDS_FILE, seen)
+
+
 # ── Main Entry Point ─────────────────────────────────────────────────
 
 
@@ -569,6 +608,8 @@ async def scrape_all(
     llm_api_key: str | None = None,
     start_page: int = 1,
     max_notices: int = 0,
+    seen_ids: dict[str, str] | None = None,
+    on_search_complete=None,
 ) -> list[NoticeData]:
     """Main entry point for scraping.
 
@@ -579,12 +620,23 @@ async def scrape_all(
         on_batch: Optional async callback(list[NoticeData]) called after each search.
         since_date_override: If set (YYYY-MM-DD), overrides the mode-based date logic.
         start_page: Start scraping from this page number (default 1).
+        seen_ids: Cross-run dict of already-processed notice IDs. If None, loads from
+                  SEEN_IDS_FILE. Caller (e.g. Apify) can pass its own dict loaded
+                  from KVS to participate in the dedup cache.
+        on_search_complete: Optional async callback(seen_ids) fired after each search
+                            completes, so callers can persist seen_ids to their own
+                            backing store (e.g. Apify KVS).
 
     Returns:
         All scraped and filtered NoticeData.
     """
     if searches is None:
         searches = SAVED_SEARCHES
+
+    # Load the cross-run seen-ID cache (caller may have pre-loaded for KVS-backed stores)
+    if seen_ids is None:
+        seen_ids = load_seen_ids()
+    logger.info("Cross-run dedup: %d previously-seen notice IDs loaded", len(seen_ids))
 
     # Determine date cutoff
     since_date: str | None = None
@@ -656,7 +708,7 @@ async def scrape_all(
                 search_notices = await run_saved_search(
                     page, search, since_date, llm_api_key,
                     on_page_batch=on_batch, start_page=start_page,
-                    max_notices=remaining,
+                    max_notices=remaining, seen_ids=seen_ids,
                 )
                 all_notices.extend(search_notices)
             except Exception:
@@ -667,11 +719,23 @@ async def scrape_all(
                         search_notices = await run_saved_search(
                             page, search, since_date, llm_api_key,
                             on_page_batch=on_batch, start_page=start_page,
-                            max_notices=remaining,
+                            max_notices=remaining, seen_ids=seen_ids,
                         )
                         all_notices.extend(search_notices)
                     except Exception:
                         logger.exception("Still failing after re-login: %s", search.saved_search_name)
+
+            # Incremental persistence — if a later search crashes fatally, progress
+            # from completed searches is not lost. Covers the re-pull bug where a
+            # single end-of-run save at line 722 used to silently skip on exceptions.
+            try:
+                save_seen_ids(seen_ids)
+                if mode == "daily":
+                    save_last_run_date()
+                if on_search_complete is not None:
+                    await on_search_complete(seen_ids)
+            except Exception:
+                logger.exception("Failed to persist seen_ids after %s", search.saved_search_name)
 
             if max_notices and len(all_notices) >= max_notices:
                 logger.info("Reached max_notices limit (%d) — stopping", max_notices)
@@ -681,6 +745,7 @@ async def scrape_all(
 
     if mode == "daily":
         save_last_run_date()
+    save_seen_ids(seen_ids)
 
     logger.info("Total notices scraped: %d", len(all_notices))
     return all_notices

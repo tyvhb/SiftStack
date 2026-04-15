@@ -123,9 +123,73 @@ def _get_contact_for_trace(notice: NoticeData) -> tuple[str, str, str, str, str]
     return ("", "", "", "", "")
 
 
+def _lookup_missing_heir_addresses(
+    notice: NoticeData, api_key: str | None,
+) -> int:
+    """Fill in mailing addresses for signing-authority heirs that lack one.
+
+    For each living heir with signing_authority=true but no `street`, runs the
+    existing DM address waterfall (Knox Tax → Serper/Firecrawl → DDG) and stores
+    the result back onto the heir. Mutates notice.heir_map_json in place.
+
+    Returns the number of heirs that gained an address.
+    """
+    if not notice.heir_map_json:
+        return 0
+    try:
+        heirs = json.loads(notice.heir_map_json)
+    except (json.JSONDecodeError, TypeError):
+        return 0
+    if not isinstance(heirs, list):
+        return 0
+
+    # Lazy import to avoid a hard dependency cycle on obituary_enricher
+    from obituary_enricher import _lookup_dm_address
+
+    city_hint = (notice.city or "").strip()
+    filled = 0
+    for heir in heirs:
+        if not isinstance(heir, dict):
+            continue
+        if not heir.get("signing_authority"):
+            continue
+        if heir.get("status") == "deceased":
+            continue
+        if (heir.get("street") or "").strip():
+            continue
+        heir_name = (heir.get("name") or "").strip()
+        if not heir_name:
+            continue
+
+        try:
+            addr = _lookup_dm_address(
+                heir_name, city_hint, api_key or "", tracerfy_tier1=False,
+            )
+        except Exception as e:
+            logger.debug("Heir address lookup failed for %s: %s", heir_name, e)
+            continue
+        if addr and addr.get("street"):
+            heir["street"] = addr.get("street", "")
+            heir["city"] = addr.get("city", "") or city_hint
+            heir["state"] = addr.get("state", "") or "TN"
+            heir["zip"] = addr.get("zip", "")
+            heir["address_source"] = addr.get("source", "")
+            filled += 1
+            logger.info(
+                "  Heir address filled: %s → %s, %s",
+                heir_name, heir["street"], heir.get("city", ""),
+            )
+
+    if filled:
+        notice.heir_map_json = json.dumps(heirs, ensure_ascii=False)
+    return filled
+
+
 def batch_skip_trace(
     notices: list[NoticeData],
     max_signing_traces: int = 5,
+    lookup_heir_addresses: bool = True,
+    address_lookup_api_key: str | None = None,
 ) -> dict:
     """Run Tracerfy batch skip trace on all records.
 
@@ -136,8 +200,13 @@ def batch_skip_trace(
     per property). DM #1's phones go to flat NoticeData fields; other heirs'
     phones/emails are stored in their heir_map_json entry.
 
+    When lookup_heir_addresses is True, signing-authority heirs without a known
+    mailing address get one looked up (Knox Tax → people search) before the trace
+    so Tracerfy has enough info to return phones. Uses ANTHROPIC_API_KEY (or the
+    explicit override) for LLM-based extraction from people-search pages.
+
     Returns stats dict: {total, submitted, matched, phones_found, emails_found,
-                         cost, signing_heirs_traced}.
+                         cost, signing_heirs_traced, heir_addresses_filled}.
     """
     stats = {
         "total": len(notices),
@@ -147,11 +216,28 @@ def batch_skip_trace(
         "emails_found": 0,
         "cost": 0.0,
         "signing_heirs_traced": 0,
+        "heir_addresses_filled": 0,
     }
 
     if not cfg.TRACERFY_API_KEY:
         logger.warning("Tracerfy API key not set — skipping batch skip trace")
         return stats
+
+    # Fill missing heir addresses BEFORE building the trace batch — otherwise
+    # those heirs get silently dropped at the `if not heir.get("street")` check
+    # in _get_contacts_for_trace and never get Tracerfy phones.
+    if lookup_heir_addresses:
+        llm_key = address_lookup_api_key or getattr(cfg, "ANTHROPIC_API_KEY", "") or None
+        for notice in notices:
+            if notice.owner_deceased != "yes":
+                continue
+            try:
+                stats["heir_addresses_filled"] += _lookup_missing_heir_addresses(notice, llm_key)
+            except Exception:
+                logger.exception("Heir address lookup pass failed for notice")
+        if stats["heir_addresses_filled"]:
+            logger.info("Heir address backfill: %d heir(s) gained an address",
+                        stats["heir_addresses_filled"])
 
     # Build lookup map: list of (notice, first, last, address, city, zip, heir_key)
     # Multiple entries per notice for signing-authority heirs

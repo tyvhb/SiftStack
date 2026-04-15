@@ -15,6 +15,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
 LOG_DIR = PROJECT_ROOT / "logs"
 STATE_FILE = PROJECT_ROOT / "last_run.json"
+SEEN_IDS_FILE = PROJECT_ROOT / "seen_ids.json"
+SEEN_IDS_PRUNE_DAYS = 90
 COOKIES_FILE = PROJECT_ROOT / "cookies.json"
 DROPBOX_STATE_FILE = PROJECT_ROOT / "dropbox_state.json"
 PHOTO_STATE_FILE = PROJECT_ROOT / "photo_state.json"
@@ -111,8 +113,6 @@ class SavedSearch:
 SAVED_SEARCHES: list[SavedSearch] = [
     SavedSearch("Knox", "foreclosure", "Foreclosure V2 Knox"),
     SavedSearch("Blount", "foreclosure", "Foreclosure V2 Blount"),
-    SavedSearch("Knox", "probate", "Probate V2 Knox"),
-    SavedSearch("Blount", "probate", "Probate V2 Blount"),
 ]
 
 # ── Entity Detection ──────────────────────────────────────────────────
