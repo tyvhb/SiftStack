@@ -36,6 +36,12 @@ _STATUS_MAP = {
     "FOR_RENT": "For Rent",
     "OFF_MARKET": "Off Market",
     "OTHER": "Off Market",
+    "AUCTION": "Off Market",
+    "FORECLOSURE": "Off Market",
+    "FORECLOSURE_AUCTION": "Off Market",
+    "PRE_FORECLOSURE": "Off Market",
+    "BANK_OWNED": "Off Market",
+    "REO": "Off Market",
 }
 
 _TYPE_MAP = {
@@ -208,14 +214,42 @@ def _normalize_lot_size(data: dict) -> str:
     return str(int(val))
 
 
+_AUCTION_SUBTYPE_KEYS = (
+    # snake_case (listing_sub_type dict)
+    "is_forAuction",
+    "is_foreclosure",
+    "is_bankOwned",
+    "is_preForeclosure",
+    # camelCase (listingSubType dict)
+    "isForAuction",
+    "isForeclosure",
+    "isBankOwned",
+)
+
+
+def _is_auction_listing(data: dict) -> bool:
+    subtype = data.get("listingSubType") or data.get("listing_sub_type") or {}
+    if isinstance(subtype, dict):
+        for key in _AUCTION_SUBTYPE_KEYS:
+            if subtype.get(key):
+                return True
+    for key in _AUCTION_SUBTYPE_KEYS:
+        if data.get(key):
+            return True
+    return False
+
+
 def _apply_property_data(notice: NoticeData, data: dict) -> bool:
     """Map Zillow response fields onto a NoticeData object (in-place).
 
     Returns True if enrichment was successful (at least homeStatus or zestimate found).
     """
-    # MLS status
+    # MLS status -- auction/foreclosure listings are NOT on the MLS
     raw_status = data.get("homeStatus") or ""
-    notice.mls_status = _STATUS_MAP.get(raw_status.upper(), raw_status.replace("_", " ").title())
+    if _is_auction_listing(data):
+        notice.mls_status = "Off Market"
+    else:
+        notice.mls_status = _STATUS_MAP.get(raw_status.upper(), raw_status.replace("_", " ").title())
 
     # Listing price
     notice.mls_listing_price = _get_listing_price(data, notice.mls_status)
